@@ -2,6 +2,7 @@
 Implementation of a chatbot for OpenCampas
 """
 
+import gc
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -157,6 +158,8 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
                 )
             outputs = outputs.narrow(1, in_seq_len, outputs.shape[1] - in_seq_len)
             del past_key_values
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # step-3: decode the output
         decodeds = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)

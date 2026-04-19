@@ -1393,21 +1393,35 @@ class DynamicLRQKCache(cache_utils.Cache):
         self._lwattn_factory = lwattn_factory
         self.init_aq_ak_method = init_aq_ak_method
 
-        # Lambdas read self.num_active_tokens at call-time so that a float
-        # ratio resolved during the first prefill is picked up correctly.
-        self.lwattn = defaultdict(lambda: self._lwattn_factory(
-            num_lite_tokens=self.lite_tokens,
-            attn_topk=self.num_active_tokens,
-            num_key_value_groups=self.num_key_value_groups,
-            r=self.r,
-            max_iter=self.max_iter,
-            tol=self.tol,
-            capacity=self.max_sequence_length,
-            init_aq_ak_method=self.init_aq_ak_method,
+        # Use a mutable box instead of capturing self in the lambdas to avoid
+        # a reference cycle (self -> lwattn -> factory-lambda -> self) that
+        # prevents CPython's reference counter from freeing the cache after
+        # use, causing pinned CPU KVcpu memory to accumulate across samples.
+        _nat_box = [num_active_tokens]
+        self._nat_box = _nat_box  # keep the box alive alongside self
+
+        _factory = self._lwattn_factory
+        _lite_tokens = self.lite_tokens
+        _nkvg = self.num_key_value_groups
+        _r = self.r
+        _max_iter = self.max_iter
+        _tol = self.tol
+        _max_seq_len = self.max_sequence_length
+        _init_method = self.init_aq_ak_method
+
+        self.lwattn = defaultdict(lambda: _factory(
+            num_lite_tokens=_lite_tokens,
+            attn_topk=_nat_box[0],
+            num_key_value_groups=_nkvg,
+            r=_r,
+            max_iter=_max_iter,
+            tol=_tol,
+            capacity=_max_seq_len,
+            init_aq_ak_method=_init_method,
         ))
 
         self.temp_buff_cache_qkv = defaultdict(
-            lambda: _CacheQKV(self.num_active_tokens, 2))  # type: Dict[int, _CacheQKV]
+            lambda: _CacheQKV(_nat_box[0], 2))  # type: Dict[int, _CacheQKV]
 
         self.sequence_state = defaultdict(
             lambda: DynamicLRQKCache.State.pending)
@@ -1486,6 +1500,7 @@ class DynamicLRQKCache(cache_utils.Cache):
             # current input length, mirroring the shadowkv pattern.
             if isinstance(self.num_active_tokens, float):
                 self.num_active_tokens = max(1, int(self.num_active_tokens * seq_len))
+                self._nat_box[0] = self.num_active_tokens
 
             if attention_mask is not None and attention_mask.dim() == 2:
                 key_states = key_states.clone()
