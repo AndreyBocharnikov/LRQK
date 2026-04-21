@@ -102,8 +102,9 @@ def take_along_dim_with_mask_python(
         src.shape[1], src.shape[2], indices, indices_mask)
     linear_indices_cpu = linear_indices.to(src.device)
     flat_src = src.view(-1, src.size(-1))  # [bsz*kv_heads*seq_len, hdim]
-    return cpp_kernel.d0_index_select(
-        flat_src, linear_indices_cpu).to(indices.device)
+    return flat_src.index_select(0, linear_indices.to(flat_src.device))
+    # return cpp_kernel.d0_index_select(
+        # flat_src, linear_indices_cpu).to(indices.device)
 
 
 def linalg_solve_f32(A: torch.Tensor, B: torch.Tensor, left: bool = True) -> torch.Tensor:
@@ -664,12 +665,12 @@ class AutoIncreaseTensor:
             init_cap = max(self.capacity, int(length * self.scaling_ratio))
             shape = list(x.shape)
             shape[self.dim] = init_cap
-            self.data = torch.empty(
+            self.data = torch.zeros(
                 shape,
                 device=self.device,
                 dtype=self.dtype,
                 pin_memory=self.pin_memory,
-            ).zero_()
+            )
             self.capacity = init_cap
 
         elif target_length >= self.capacity:
@@ -683,17 +684,16 @@ class AutoIncreaseTensor:
                 self.data = self.data.resize_(new_shape)
                 self.data.narrow(self.dim, self.current_len, new_cap - self.current_len).zero_()
             else:
-                new_data = torch.empty(
+                new_data = torch.zeros(
                     new_shape,
                     device=self.device,
                     dtype=self.dtype,
                     pin_memory=self.pin_memory,
-                ).zero_()
+                )
                 new_data.narrow(self.dim, 0, self.current_len).copy_(
                     self.data.narrow(self.dim, 0, self.current_len),
                 )
                 self.data = new_data
-                torch.cuda.empty_cache()
 
             self.capacity = new_cap
 
@@ -857,8 +857,8 @@ class LightAttentionIndicesFactory:
             capacity=capacity,
             dim=2,
             scaling_ratio=scaling_ratio,
-            device="cpu",
-            pin_memory=True,
+            device=device,
+            pin_memory=False,
         )
 
         self.Kgpu: torch.Tensor = None
@@ -1013,6 +1013,7 @@ class LightAttentionIndicesFactory:
         hit_indices: torch.Tensor,
         dst_mask: Optional[torch.Tensor] = None,
     ):
+        assert src.device == dst.device
         bsz, kvheads, seq_len, hdim = src.shape
 
         num_hitted_indices = hit_indices.shape[2]
@@ -1040,7 +1041,7 @@ class LightAttentionIndicesFactory:
                         .expand(bsz, kvheads, self.num_key_value_groups, seq_len, hdim)
                     ),
                     hit_indices.view(
-                        bsz, kvheads, self.num_key_value_groups, -1, 1).cpu(),
+                        bsz, kvheads, self.num_key_value_groups, -1, 1),
                     dim=3,
                 ).view(bsz, kvheads * self.num_key_value_groups, -1, hdim)
                 dst.copy_(out)
@@ -1347,7 +1348,7 @@ class LightAttentionIndicesNoHitMiss(LightAttentionIndicesFactory):
                 .expand(-1, -1, self.num_key_value_groups, -1, -1)
             ),
             hit_indices.view(
-                bsz, kvheads, self.num_key_value_groups, -1, 1).cpu(),
+                bsz, kvheads, self.num_key_value_groups, -1, 1),
             dim=3,
         ).view(bsz, kvheads * self.num_key_value_groups, -1, dndim)
 
@@ -1553,7 +1554,6 @@ class DynamicLRQKCache(cache_utils.Cache):
                 key_states,
                 value_states,
             )
-            torch.cuda.empty_cache()
 
         return kcache, vcache
 

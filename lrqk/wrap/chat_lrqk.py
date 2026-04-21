@@ -106,6 +106,10 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
     ) -> List[str]:
         """Adopt from super.generate"""
 
+        seed = 42
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
         messages = _convert_chat_messages(inputs)
 
         inputs = self.tokenizer.apply_chat_template(
