@@ -16,8 +16,10 @@ import warnings
 
 from opencompass.registry import MODELS
 # from lrqk.wrap.registry_lrqk import LRQK_REGISTRY
-import lrqk_attention_transformers_4_52 as lrqk_attention
-import kvquant_lib as kvquant
+if int(transformers.__version__.split('.', maxsplit=1)[0]) >= 5:
+    import lrqk_attention_transformers_5_6 as lrqk_attention
+else:
+    import lrqk_attention_transformers_4_52 as lrqk_attention
 
 # from opencompass.models.base import BaseModel
 
@@ -42,11 +44,13 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         self.yarn_config = yarn_config if yarn_config is not None else dict()
 
         if kvquant_config is not None:
+            import kvquant_lib as kvquant
             if kvquant_config.get('model_name_or_path', None) != path:
                 warnings.warn(f"kvquant_config.model_name_or_path ({kvquant_config.get('model_name_or_path', None)}) is not the same as path ({path}).")
                 kvquant_config['model_name_or_path'] = path
-
-        self.kvquant_config = kvquant.KVQuantConfig.from_dict(kvquant_config)
+            self.kvquant_config = kvquant.KVQuantConfig.from_dict(kvquant_config)
+        else:
+            self.kvquant_config = None
 
         super().__init__(path, **kwargs)
         self.lrqk_rank = lrqk_rank
@@ -68,10 +72,12 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         self.lwattn_factory = lwattn_factory
 
         # four lambdas are 1.0
-        _conf = self.model.config
-
-        num_key_value_groups = _conf.num_attention_heads // _conf.num_key_value_heads
-        self.num_key_value_groups = num_key_value_groups
+        if hasattr(self, "model"):
+            _conf = self.model.config
+            num_key_value_groups = _conf.num_attention_heads // _conf.num_key_value_heads
+            self.num_key_value_groups = num_key_value_groups
+        else:
+            self.num_key_value_groups = 1
 
     def _load_model(self, path: str, kwargs: dict, peft_path: Optional[str] = None, peft_kwargs: dict = dict()):
         device = kwargs.get('device', 'cuda:0')
@@ -80,6 +86,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
 
         if self.kvquant_config is not None:
             # enable kvquant
+            import kvquant_lib as kvquant
             assert self.kvquant_config.model_name_or_path == path, f"kvquant_config.model_name_or_path must be the same as path"
             print(f"Loading kvquant model from {self.kvquant_config.model_name_or_path}")
             model = kvquant.create_kvquant_model(self.kvquant_config, device=device)
@@ -171,6 +178,4 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         #     decodeds = [t.split(stop)[0] for t in decodeds]
 
         return decodeds
-
-
 

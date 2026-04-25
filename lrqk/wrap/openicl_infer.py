@@ -16,7 +16,10 @@ from opencompass.utils import (build_dataset_from_cfg, build_model_from_cfg,
                                get_infer_output_path, get_logger,
                                model_abbr_from_cfg, task_abbr_from_cfg)
 
-import lrqk.wrap.chat_kvquant
+try:
+    import lrqk.wrap.chat_kvquant
+except Exception:
+    pass
 import lrqk.wrap.chat_lrqk
 import lrqk.wrap.chat_empty
 import lrqk.wrap.subset_gsm8k
