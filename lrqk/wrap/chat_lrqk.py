@@ -34,6 +34,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         lrqk_tol: float = 1e-2,
         lrqk_init_aq_ak_method: str = 'randn',
         cache_on_device: bool = True,
+        offload_runtime_tensors: Optional[tuple[str, ...]] = None,
         yarn_config: Optional[Dict] = None,
         lwattn_factory = lrqk_attention.LightAttentionIndicesFactory,
         kvquant_config: Optional[Dict] = None,
@@ -57,6 +58,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         self.lrqk_tol = lrqk_tol
         self.lrqk_init_aq_ak_method = lrqk_init_aq_ak_method
         self.cache_on_device = cache_on_device
+        self.offload_runtime_tensors = offload_runtime_tensors
 
         if lwattn_factory is None:
             lwattn_factory = lrqk_attention.LightAttentionIndicesFactory
@@ -143,6 +145,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         # step-2: conduct model forward to generate output
         with torch.no_grad():
             in_seq_len = inputs.input_ids.shape[1]
+            max_sequence_length = in_seq_len + (max_out_len if max_out_len is not None else 0)
             with torch.autocast("cuda", dtype=self.model.dtype):
                 past_key_values = lrqk_attention.DynamicLRQKCache(
                     num_key_value_groups=self.num_key_value_groups,
@@ -154,6 +157,8 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
                     lwattn_factory=self.lwattn_factory,
                     init_aq_ak_method=self.lrqk_init_aq_ak_method,
                     cache_on_device=self.cache_on_device,
+                    max_sequence_length=max_sequence_length,
+                    offload_runtime_tensors=self.offload_runtime_tensors,
                 )
                 print(self.lwattn_factory)
                 outputs = self.model.generate(
@@ -174,5 +179,3 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         #     decodeds = [t.split(stop)[0] for t in decodeds]
 
         return decodeds
-
-

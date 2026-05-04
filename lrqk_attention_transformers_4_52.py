@@ -820,6 +820,7 @@ class LightAttentionIndicesFactory:
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         cache_on_device: bool = True,
+        offload_runtime_tensors: Optional[Tuple[str, ...]] = None,
     ):
         self.num_lite_tokens = num_lite_tokens
         self.attn_topk = attn_topk
@@ -830,6 +831,30 @@ class LightAttentionIndicesFactory:
         self.tol = _ensure_tuple2(tol)
         self.init_aq_ak_method = init_aq_ak_method
         self.cache_on_device = cache_on_device
+
+        if offload_runtime_tensors is None:
+            if self.cache_on_device:
+                offload_runtime_tensors = tuple()
+            else:
+                offload_runtime_tensors = ("Kgpu", "Vgpu", "hit_indices")
+        elif isinstance(offload_runtime_tensors, list):
+            offload_runtime_tensors = tuple(offload_runtime_tensors)
+
+        allowed_offload_tensors = {
+            "A_K",
+            "B_Q",
+            "B_K",
+            "Kgpu",
+            "Vgpu",
+            "hit_indices",
+        }
+        unknown_offload_tensors = set(offload_runtime_tensors) - allowed_offload_tensors
+        if len(unknown_offload_tensors) > 0:
+            raise ValueError(
+                f"Unknown offload tensor names: {sorted(unknown_offload_tensors)}. "
+                f"Allowed values: {sorted(allowed_offload_tensors)}"
+            )
+        self.offload_runtime_tensors = tuple(offload_runtime_tensors)
 
         self.gpu_capacity = attn_topk + num_lite_tokens
 
@@ -845,10 +870,11 @@ class LightAttentionIndicesFactory:
             raise ValueError("weights must be a float or a tuple of length 4")
 
         self.B_Q: Optional[torch.Tensor] = None
+        a_k_scaling_ratio = scaling_ratio if self.cache_on_device else 1.0
         self._A_K = AutoIncreaseTensor(
             capacity=capacity,
             dim=2,
-            scaling_ratio=scaling_ratio,
+            scaling_ratio=a_k_scaling_ratio,
             device=device,
             dtype=dtype,
         )
@@ -880,6 +906,69 @@ class LightAttentionIndicesFactory:
 
     def __len__(self):
         return self.current_len
+
+    @staticmethod
+    def _move_tensor(
+        tensor: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.device == device:
+            return tensor
+        return tensor.to(device, non_blocking=True)
+
+    def _move_runtime_tensor(
+        self,
+        tensor_name: str,
+        device: torch.device,
+    ):
+        if tensor_name == "A_K":
+            if self._A_K.data is not None:
+                self._A_K.data = self._move_tensor(self._A_K.data, device)
+            self._A_K.device = device
+        elif tensor_name == "B_Q":
+            self.B_Q = self._move_tensor(self.B_Q, device)
+        elif tensor_name == "B_K":
+            self.B_K = self._move_tensor(self.B_K, device)
+        elif tensor_name == "Kgpu":
+            self.Kgpu = self._move_tensor(self.Kgpu, device)
+        elif tensor_name == "Vgpu":
+            self.Vgpu = self._move_tensor(self.Vgpu, device)
+        elif tensor_name == "hit_indices":
+            self.hit_indices = self._move_tensor(self.hit_indices, device)
+
+    def _resolve_offload_tensor_names(
+        self,
+        tensor_names: Optional[Tuple[str, ...]] = None,
+    ) -> Tuple[str, ...]:
+        if tensor_names is None:
+            return self.offload_runtime_tensors
+        if isinstance(tensor_names, list):
+            tensor_names = tuple(tensor_names)
+        return tensor_names
+
+    def ensure_runtime_device(
+        self,
+        device: Union[str, torch.device],
+        tensor_names: Optional[Tuple[str, ...]] = None,
+    ):
+        if self.cache_on_device:
+            return
+
+        tensor_names = self._resolve_offload_tensor_names(tensor_names)
+        target_device = torch.device(device)
+        for tensor_name in tensor_names:
+            self._move_runtime_tensor(tensor_name, target_device)
+
+    def offload_runtime_cache(self, tensor_names: Optional[Tuple[str, ...]] = None):
+        if self.cache_on_device:
+            return
+
+        tensor_names = self._resolve_offload_tensor_names(tensor_names)
+        cpu_device = torch.device("cpu")
+        for tensor_name in tensor_names:
+            self._move_runtime_tensor(tensor_name, cpu_device)
 
     @property
     def Klite(self):
@@ -1074,6 +1163,7 @@ class LightAttentionIndicesFactory:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
     ):
+        self.ensure_runtime_device(query_states.device)
         bsz, nheads, seq_len, hdim = query_states.shape
 
         assert seq_len >= self.attn_topk, "seq_len must be larger than attn_topk"
@@ -1169,6 +1259,7 @@ class LightAttentionIndicesFactory:
         key_states: torch.Tensor,
         value_states: torch.Tensor,
     ):
+        self.ensure_runtime_device(query_states.device)
         self._append(key_states, value_states)
 
         rep_key_states = modeling_qwen2.repeat_kv(
@@ -1238,8 +1329,8 @@ class LightAttentionIndicesFactory:
             _out_k = out.narrow(1, 0, hidden_size)
             _out_v = out.narrow(1, hidden_size, hidden_size)
 
-            dstK[dst_mask] = _out_k
-            dstV[dst_mask] = _out_v
+            dstK[dst_mask] = _out_k.to(dstK.device)
+            dstV[dst_mask] = _out_v.to(dstV.device)
 
         return self.Kgpu, self.Vgpu
 
@@ -1294,6 +1385,7 @@ class LightAttentionIndicesNoHitMiss(LightAttentionIndicesFactory):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
     ):
+        self.ensure_runtime_device(query_states.device)
         self._append(key_states, value_states)
 
         rep_key_states = modeling_qwen2.repeat_kv(
@@ -1393,6 +1485,7 @@ class DynamicLRQKCache(cache_utils.Cache):
         lwattn_factory=LightAttentionIndicesFactory,
         init_aq_ak_method: Union[InitAQAK, str] = InitAQAK.randn,
         cache_on_device: bool = True,
+        offload_runtime_tensors: Optional[Tuple[str, ...]] = None,
     ):
         super().__init__()
 
@@ -1410,6 +1503,26 @@ class DynamicLRQKCache(cache_utils.Cache):
         self.init_aq_ak_method = init_aq_ak_method
         self.cache_on_device = cache_on_device
 
+        if offload_runtime_tensors is None:
+            if self.cache_on_device:
+                prefill_offload_runtime_tensors = tuple()
+                decode_offload_runtime_tensors = tuple()
+            else:
+                prefill_offload_runtime_tensors = ("A_K",)
+                decode_offload_runtime_tensors = tuple()
+        else:
+            if isinstance(offload_runtime_tensors, list):
+                offload_runtime_tensors = tuple(offload_runtime_tensors)
+            prefill_offload_runtime_tensors = tuple(offload_runtime_tensors)
+            decode_offload_runtime_tensors = tuple(offload_runtime_tensors)
+
+        self.prefill_offload_runtime_tensors = prefill_offload_runtime_tensors
+        self.decode_offload_runtime_tensors = decode_offload_runtime_tensors
+        self._all_offload_runtime_tensors = tuple(dict.fromkeys(
+            self.prefill_offload_runtime_tensors
+            + self.decode_offload_runtime_tensors
+        ))
+
         # Use a mutable box instead of capturing self in the lambdas to avoid
         # a reference cycle (self -> lwattn -> factory-lambda -> self) that
         # prevents CPython's reference counter from freeing the cache after
@@ -1426,6 +1539,7 @@ class DynamicLRQKCache(cache_utils.Cache):
         _max_seq_len = self.max_sequence_length
         _init_method = self.init_aq_ak_method
         _cache_on_device = self.cache_on_device
+        _all_offload_runtime_tensors = self._all_offload_runtime_tensors
 
         self.lwattn = defaultdict(lambda: _factory(
             num_lite_tokens=_lite_tokens,
@@ -1437,6 +1551,7 @@ class DynamicLRQKCache(cache_utils.Cache):
             capacity=_max_seq_len,
             init_aq_ak_method=_init_method,
             cache_on_device=_cache_on_device,
+            offload_runtime_tensors=_all_offload_runtime_tensors,
         ))
 
         self.temp_buff_cache_qkv = defaultdict(
@@ -1444,6 +1559,8 @@ class DynamicLRQKCache(cache_utils.Cache):
 
         self.sequence_state = defaultdict(
             lambda: DynamicLRQKCache.State.pending)
+
+        self._last_used_layer_idx: Optional[int] = None
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("DynamicLRQKCache does not support indexing")
@@ -1475,6 +1592,23 @@ class DynamicLRQKCache(cache_utils.Cache):
         """Deprecated compatibility property."""
         return self.get_seq_length()
 
+    def _prepare_layer_cache(
+        self,
+        layer_idx: int,
+        device: torch.device,
+        load_tensor_names: Tuple[str, ...],
+        offload_tensor_names: Tuple[str, ...],
+    ):
+        if self.cache_on_device:
+            return
+
+        prev_layer_idx = self._last_used_layer_idx
+        if prev_layer_idx is not None and prev_layer_idx != layer_idx and prev_layer_idx in self.lwattn:
+            self.lwattn[prev_layer_idx].offload_runtime_cache(offload_tensor_names)
+
+        if layer_idx in self.lwattn:
+            self.lwattn[layer_idx].ensure_runtime_device(device, load_tensor_names)
+
     def update(
         self,
         query_states: torch.Tensor,
@@ -1505,6 +1639,19 @@ class DynamicLRQKCache(cache_utils.Cache):
             raise ValueError(
                 "None of query_states, key_states, and value_states can be None"
             )
+
+        is_decode_step = query_states.shape[2] == 1
+        offload_tensor_names = (
+            self.decode_offload_runtime_tensors
+            if is_decode_step
+            else self.prefill_offload_runtime_tensors
+        )
+        self._prepare_layer_cache(
+            layer_idx,
+            query_states.device,
+            self._all_offload_runtime_tensors,
+            offload_tensor_names,
+        )
 
         state = self.sequence_state[layer_idx]
 
@@ -1572,6 +1719,9 @@ class DynamicLRQKCache(cache_utils.Cache):
                 key_states,
                 value_states,
             )
+
+        if not self.cache_on_device:
+            self._last_used_layer_idx = layer_idx
 
         return kcache, vcache
 
