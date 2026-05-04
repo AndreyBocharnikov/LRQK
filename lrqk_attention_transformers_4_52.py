@@ -819,6 +819,7 @@ class LightAttentionIndicesFactory:
         scaling_ratio: float = 1.5,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        cache_on_device: bool = True,
     ):
         self.num_lite_tokens = num_lite_tokens
         self.attn_topk = attn_topk
@@ -828,6 +829,7 @@ class LightAttentionIndicesFactory:
         self.max_iter = _ensure_tuple2(max_iter)
         self.tol = _ensure_tuple2(tol)
         self.init_aq_ak_method = init_aq_ak_method
+        self.cache_on_device = cache_on_device
 
         self.gpu_capacity = attn_topk + num_lite_tokens
 
@@ -853,12 +855,15 @@ class LightAttentionIndicesFactory:
 
         self.B_K: Optional[torch.Tensor] = None
 
+        kv_cache_device = device if self.cache_on_device else "cpu"
+        kv_cache_pin_memory = False if self.cache_on_device else True
+
         self.KVcpu = AutoIncreaseTensorSharedKV(
             capacity=capacity,
             dim=2,
             scaling_ratio=scaling_ratio,
-            device=device,
-            pin_memory=False,
+            device=kv_cache_device,
+            pin_memory=kv_cache_pin_memory,
         )
 
         self.Kgpu: torch.Tensor = None
@@ -1013,10 +1018,13 @@ class LightAttentionIndicesFactory:
         hit_indices: torch.Tensor,
         dst_mask: Optional[torch.Tensor] = None,
     ):
-        assert src.device == dst.device
         bsz, kvheads, seq_len, hdim = src.shape
 
         num_hitted_indices = hit_indices.shape[2]
+
+        gather_indices = hit_indices
+        if gather_indices.device != src.device:
+            gather_indices = gather_indices.to(src.device)
 
         if num_hitted_indices < self.attn_topk:
             dst = dst.narrow(2, 0, num_hitted_indices)
@@ -1027,7 +1035,7 @@ class LightAttentionIndicesFactory:
                     src.unsqueeze(2)
                     .expand(bsz, kvheads, self.num_key_value_groups, seq_len, hdim)
                 ),
-                hit_indices.view(
+                gather_indices.view(
                     bsz, kvheads, self.num_key_value_groups, -1, 1),
                 dim=3,
                 out=dst.view(
@@ -1040,7 +1048,7 @@ class LightAttentionIndicesFactory:
                         src.unsqueeze(2)
                         .expand(bsz, kvheads, self.num_key_value_groups, seq_len, hdim)
                     ),
-                    hit_indices.view(
+                    gather_indices.view(
                         bsz, kvheads, self.num_key_value_groups, -1, 1),
                     dim=3,
                 ).view(bsz, kvheads * self.num_key_value_groups, -1, hdim)
@@ -1050,6 +1058,8 @@ class LightAttentionIndicesFactory:
                     bsz, kvheads, self.num_key_value_groups, -1)
                 _mask = dst_mask.view(
                     bsz, kvheads, self.num_key_value_groups, -1)
+                if _indices.device != _mask.device:
+                    _mask = _mask.to(_indices.device)
                 out = take_along_dim_with_mask_python(src, _indices, _mask)
 
                 dst_mask = dst_mask.view(
@@ -1342,12 +1352,16 @@ class LightAttentionIndicesNoHitMiss(LightAttentionIndicesFactory):
 
         dndim = key_states.shape[-1] * 2
 
+        gather_indices = hit_indices
+        if gather_indices.device != self.KVcpu.data.device:
+            gather_indices = gather_indices.to(self.KVcpu.data.device)
+
         out = torch.take_along_dim(
             (
                 self.KVcpu.data.unsqueeze(2)
                 .expand(-1, -1, self.num_key_value_groups, -1, -1)
             ),
-            hit_indices.view(
+            gather_indices.view(
                 bsz, kvheads, self.num_key_value_groups, -1, 1),
             dim=3,
         ).view(bsz, kvheads * self.num_key_value_groups, -1, dndim)
@@ -1378,6 +1392,7 @@ class DynamicLRQKCache(cache_utils.Cache):
         num_key_value_groups: int = 1,
         lwattn_factory=LightAttentionIndicesFactory,
         init_aq_ak_method: Union[InitAQAK, str] = InitAQAK.randn,
+        cache_on_device: bool = True,
     ):
         super().__init__()
 
@@ -1393,6 +1408,7 @@ class DynamicLRQKCache(cache_utils.Cache):
         self.max_sequence_length = max_sequence_length
         self._lwattn_factory = lwattn_factory
         self.init_aq_ak_method = init_aq_ak_method
+        self.cache_on_device = cache_on_device
 
         # Use a mutable box instead of capturing self in the lambdas to avoid
         # a reference cycle (self -> lwattn -> factory-lambda -> self) that
@@ -1409,6 +1425,7 @@ class DynamicLRQKCache(cache_utils.Cache):
         _tol = self.tol
         _max_seq_len = self.max_sequence_length
         _init_method = self.init_aq_ak_method
+        _cache_on_device = self.cache_on_device
 
         self.lwattn = defaultdict(lambda: _factory(
             num_lite_tokens=_lite_tokens,
@@ -1419,6 +1436,7 @@ class DynamicLRQKCache(cache_utils.Cache):
             tol=_tol,
             capacity=_max_seq_len,
             init_aq_ak_method=_init_method,
+            cache_on_device=_cache_on_device,
         ))
 
         self.temp_buff_cache_qkv = defaultdict(

@@ -33,6 +33,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         lrqk_max_iter: int = 2,
         lrqk_tol: float = 1e-2,
         lrqk_init_aq_ak_method: str = 'randn',
+        cache_on_device: bool = True,
         yarn_config: Optional[Dict] = None,
         lwattn_factory = lrqk_attention.LightAttentionIndicesFactory,
         kvquant_config: Optional[Dict] = None,
@@ -55,6 +56,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         self.lrqk_lite_tokens = lrqk_lite_tokens
         self.lrqk_tol = lrqk_tol
         self.lrqk_init_aq_ak_method = lrqk_init_aq_ak_method
+        self.cache_on_device = cache_on_device
 
         if lwattn_factory is None:
             lwattn_factory = lrqk_attention.LightAttentionIndicesFactory
@@ -151,6 +153,7 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
                     max_iter=self.lrqk_max_iter,
                     lwattn_factory=self.lwattn_factory,
                     init_aq_ak_method=self.lrqk_init_aq_ak_method,
+                    cache_on_device=self.cache_on_device,
                 )
                 print(self.lwattn_factory)
                 outputs = self.model.generate(
@@ -171,6 +174,5 @@ class LRQKChatBot(HuggingFacewithChatTemplate):
         #     decodeds = [t.split(stop)[0] for t in decodeds]
 
         return decodeds
-
 
 
