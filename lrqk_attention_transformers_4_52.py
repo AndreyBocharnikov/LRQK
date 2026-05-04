@@ -662,7 +662,7 @@ class AutoIncreaseTensor:
         target_length = self.current_len + length
 
         if self.data is None:
-            init_cap = max(self.capacity, int(length * self.scaling_ratio))
+            init_cap = self.capacity
             shape = list(x.shape)
             shape[self.dim] = init_cap
             self.data = torch.zeros(
@@ -672,30 +672,6 @@ class AutoIncreaseTensor:
                 pin_memory=self.pin_memory,
             )
             self.capacity = init_cap
-
-        elif target_length >= self.capacity:
-            new_cap = self.capacity
-            while new_cap <= target_length:
-                new_cap = int(new_cap * self.scaling_ratio)
-
-            new_shape = list(self.data.shape)
-            new_shape[self.dim] = new_cap
-            if self.dim == 0:
-                self.data = self.data.resize_(new_shape)
-                self.data.narrow(self.dim, self.current_len, new_cap - self.current_len).zero_()
-            else:
-                new_data = torch.zeros(
-                    new_shape,
-                    device=self.device,
-                    dtype=self.dtype,
-                    pin_memory=self.pin_memory,
-                )
-                new_data.narrow(self.dim, 0, self.current_len).copy_(
-                    self.data.narrow(self.dim, 0, self.current_len),
-                )
-                self.data = new_data
-
-            self.capacity = new_cap
 
         if self.pin_memory:
             self.data.narrow(self.dim, self.current_len, length).copy_(x)
